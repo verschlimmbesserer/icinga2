@@ -1,0 +1,235 @@
+---
+
+- name: Add repokey for icinga2 ubuntu
+  ansible.builtin.apt_key:
+    url: "{{ icinga2_key_url }}"
+    state: present
+
+- name: Add repo ubuntu
+  ansible.builtin.apt_repository:
+    repo: "{{ icinga2_repo }}"
+    state: present
+    update_cache: true
+    filename: icinga2
+
+- name: Install icinga2 packages
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+    name: "{{ icinga2_packages }}"
+    state: present
+
+- name: Start and enable icinga2 service
+  ansible.builtin.service:
+    enabled: true
+    name: icinga2
+    state: started
+
+- name: Check if mysql is installed
+  ansible.builtin.stat:
+    path: /usr/bin/mysql
+  register: mysql
+
+- name: Check if icinga2-ido-mysql schema exists
+  ansible.builtin.stat:
+    path: /usr/share/icinga2-ido-mysql/schema/mysql.sql
+  register: icinga2_do_mysql
+
+- name: Activate ido-mysql
+  community.general.icinga2_feature:
+    name: ido-mysql
+    state: present
+  when: mysql.stat.exists
+  register: idomysql
+
+- name: Import icinga2-ido-mysql database schema
+  community.mysql.mysql_db:
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+    login_unix_socket: /var/run/mysqld/mysqld.sock
+    state: import
+    name: icinga
+    target: /usr/share/icinga2-ido-mysql/schema/mysql.sql
+  when: idomysql is changed and icinga2_do_mysql.stat.exists
+
+- name: Activate icinga2 features
+  community.general.icinga2_feature:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ icinga2_features }}"
+  when: icinga2_features|length>0
+
+- name: Setup icinga2 api
+  when: icinga2_api
+  block:
+    - name: Enable icinga2 api
+      community.general.icinga2_feature:
+        name: api
+        state: present
+
+    - name: Generate icinga2 api
+      ansible.builtin.shell:
+        cmd: icinga2 api setup
+        executable: /bin/bash
+      register: generate_icinga2_api
+      changed_when: generate_icinga2_api.rc != 0
+      notify: restart icinga2
+
+- name: Configure icinga2 features
+  ansible.builtin.template:
+    src: icinga2.conf.j2
+    dest: "/etc/icinga2/features-available/{{ item.key }}"
+    owner: nagios
+    group: nagios
+    mode: "0644"
+  loop: "{{ icinga2_features_configuration | dict2items }}"
+  when: icinga2_features_configuration is defined and icinga2_features_configuration|length>0
+  notify: restart icinga2
+
+- name: Enable icinga2 features
+  ansible.builtin.file:
+    src: "/etc/icinga2/features-available/{{ item.key }}"
+    dest: "/etc/icinga2/features-enabled/{{ item.key }}"
+    state: link
+  loop: "{{ icinga2_features_configuration | dict2items }}"
+  when: icinga2_features_configuration is defined and icinga2_features_configuration|length>0
+  notify: restart icinga2
+
+- name: Setup icinga2-web
+  when: icinga2web_install | default(true)
+  block:
+    - name: Check if icinga2 web database schema exists
+      ansible.builtin.stat:
+        path: /usr/share/icingaweb2/etc/schema/mysql.schema.sql
+      register: icinga2web_schema
+
+    - name: Import icinga2-ido-mysql database schema
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        state: import
+        name: icingaweb2
+        target: /usr/share/icingaweb2/etc/schema/mysql.schema.sql
+      when: icinga2web_schema.stat.exists and idomysql is changed
+
+    - name: Check if apache2 is installed
+      ansible.builtin.stat:
+        path: /usr/sbin/apache2
+      register: apache2
+
+    - name: Install apache2
+      ansible.builtin.apt:
+        name: apache2
+        state: present
+      when: icinga2_webserver == "apache2" and not apache2.stat.exists
+
+    - name: Check if nginx is installed
+      ansible.builtin.stat:
+        path: /usr/sbin/nginx
+      register: nginx
+
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+      when: icinga2_webserver == "nginx" and not nginx.stat.exists
+
+    - name: Check if icinga2 apache2 config exists
+      ansible.builtin.stat:
+        path: /etc/apache2/conf-available/icingaweb2.conf
+      register: icinga2_apache_conf
+
+    - name: Generate apache2 config
+      ansible.builtin.shell:
+        cmd: icingacli setup config webserver apache
+        executable: /bin/bash
+      when: apache2.stat.exists and not icinga2_apache_conf.stat.exists
+      register: apache_conf_generated
+      changed_when: apache_conf_generated.rc != 0
+
+    - name: Generate nginx config
+      ansible.builtin.shell:
+        cmd: icingacli setup config webserver nginx
+        executable: /bin/bash
+      when: nginx.stat.exists
+      register: nginx_conf_generated
+      changed_when: nginx_conf_generated.rc != 0
+
+    - name: Create icinga2 web setup token
+      ansible.builtin.shell:
+        cmd: icingacli setup token create
+        executable: /bin/bash
+      register: icinga2_web_setup_token
+      changed_when: icinga2_web_setup_token.rc != 0
+      when: nginx_conf_generated is changed or apache_conf_generated is changed
+
+    - name: Create icingaweb2_user.sql file
+      ansible.builtin.template:
+        src: icingaweb2_user.sql.j2
+        dest: /var/tmp/icingaweb2_user.sql
+        owner: root
+        group: root
+        mode: "0644"
+      register: usersqlfile
+
+    - name: Import icingaweb2_user
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        state: import
+        name: icingaweb2
+        target: /var/tmp/icingaweb2_user.sql
+      when: usersqlfile is changed
+
+    - name: Ensure www-data is in icinga2web group
+      ansible.builtin.user:
+        name: www-data
+        groups: icingaweb2
+        append: true
+
+    - name: Check if icingaweb2 sub dir exists
+      ansible.builtin.stat:
+        path: /etc/icingaweb2/
+      register: icingaweb2subdir
+
+    - name: Create icingaweb2 directories
+      ansible.builtin.shell:
+        cmd: icingacli setup config directory
+        executable: /bin/bash
+      register: icinga2_dirs
+      changed_when: icinga2_dirs.rc != 0
+      when: not icingaweb2subdir.stat.exists
+
+    - name: Check if /etc/icingaweb2/modules/translation exists
+      ansible.builtin.stat:
+        path: /etc/icingaweb2/modules/translation
+      register: translation
+
+    - name: Create /etc/icingaweb2/modules/translation
+      ansible.builtin.file:
+        path: /etc/icingaweb2/modules/translation
+        state: directory
+        owner: root
+        group: icingaweb2
+        mode: "02770"
+      when: not translation.stat.exists
+
+    - name: Create icingaweb2 monitoring dir
+      ansible.builtin.file:
+        path: /etc/icingaweb2/modules/monitoring
+        state: directory
+        owner: root
+        group: icingaweb2
+        mode: "02770"
+
+    - name: Configure icingaweb2
+      ansible.builtin.template:
+        src: icingaweb2.config.j2
+        dest: "/etc/icingaweb2/{{ item.key }}"
+        owner: www-data
+        group: icingaweb2
+        mode: "0660"
+      loop: "{{ icinga2_web_configuration | dict2items }}"
+      notify: restart icinga2
